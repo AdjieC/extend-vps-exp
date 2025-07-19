@@ -488,6 +488,306 @@ async function handleTurnstileVerification(page, maxAttempts = 5) {
     return false;
 }
 
+/**
+ * 增强的验证码图片查找功能，带重试机制
+ */
+async function findCaptchaImageWithRetry(page, maxRetries = 3) {
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            // 尝试多种选择器
+            const selectors = [
+                'img[src^="data:"]',
+                'img[src*="captcha"]',
+                'img[src*="verify"]',
+                '.captcha img',
+                '[data-captcha] img'
+            ];
+            
+            for (const selector of selectors) {
+                const img = await page.$(selector);
+                if (img) {
+                    console.log(`找到验证码图片，使用选择器: ${selector}`);
+                    return img;
+                }
+            }
+            
+            if (i < maxRetries - 1) {
+                console.log(`验证码图片查找尝试 ${i + 1} 失败，等待后重试...`);
+                await setTimeout(1000);
+            }
+        } catch (error) {
+            console.warn(`验证码图片查找出错 (尝试 ${i + 1}):`, error.message);
+        }
+    }
+    
+    return null;
+}
+
+/**
+ * 增强的验证码填充功能，支持多种策略和降级处理
+ */
+async function fillCaptchaWithFallback(page, code) {
+    const strategies = [
+        // 策略1: 使用原始选择器
+        {
+            name: 'original_placeholder',
+            action: () => page.locator('[placeholder="上の画像的数字を入力"]').fill(code)
+        },
+        // 策略2: 更广泛的input选择器
+        {
+            name: 'input_type_text',
+            action: () => page.locator('input[type="text"]').fill(code)
+        },
+        // 策略3: JavaScript 直接设置值
+        {
+            name: 'javascript_direct',
+            action: () => page.evaluate((codeValue) => {
+                const inputs = document.querySelectorAll('input[type="text"], input[placeholder*="画像"], input[placeholder*="数字"]');
+                for (const input of inputs) {
+                    if (input.offsetWidth > 0 && input.offsetHeight > 0) { // 可见元素
+                        input.value = codeValue;
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                        return true;
+                    }
+                }
+                return false;
+            }, code)
+        },
+        // 策略4: 通过ID或name属性查找
+        {
+            name: 'by_attributes',
+            action: () => page.evaluate((codeValue) => {
+                const possibleIds = ['captcha', 'code', 'verify', 'verification'];
+                const possibleNames = ['captcha', 'code', 'verify', 'verification'];
+                
+                for (const id of possibleIds) {
+                    const el = document.getElementById(id);
+                    if (el && el.tagName === 'INPUT') {
+                        el.value = codeValue;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        return true;
+                    }
+                }
+                
+                for (const name of possibleNames) {
+                    const el = document.querySelector(`input[name="${name}"]`);
+                    if (el) {
+                        el.value = codeValue;
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        return true;
+                    }
+                }
+                return false;
+            }, code)
+        }
+    ];
+    
+    for (const strategy of strategies) {
+        try {
+            console.log(`尝试验证码填充策略: ${strategy.name}`);
+            await strategy.action();
+            
+            // 验证填充是否成功
+            const fillVerified = await page.evaluate((expectedCode) => {
+                const inputs = document.querySelectorAll('input[type="text"]');
+                for (const input of inputs) {
+                    if (input.value === expectedCode) {
+                        return true;
+                    }
+                }
+                return false;
+            }, code);
+            
+            if (fillVerified) {
+                console.log(`验证码填充成功，策略: ${strategy.name}`);
+                return true;
+            }
+        } catch (error) {
+            console.warn(`验证码填充策略 ${strategy.name} 失败:`, error.message);
+        }
+    }
+    
+    console.error('所有验证码填充策略均失败');
+    return false;
+}
+
+/**
+ * 增强的表单提交功能，带重试和多种提交策略
+ */
+async function submitFormWithRetry(page, maxRetries = 3) {
+    for (let retry = 0; retry < maxRetries; retry++) {
+        try {
+            console.log(`尝试表单提交，第 ${retry + 1} 次`);
+            
+            // 等待一下，确保页面状态稳定
+            await setTimeout(1000);
+            
+            // 策略1: 原始的导航等待 + 点击
+            try {
+                const [nav] = await Promise.allSettled([
+                    page.waitForNavigation({ timeout: 30000, waitUntil: 'networkidle2' }),
+                    page.locator('text=無料VPSの利用を継続する').click(),
+                ]);
+    
+                if (nav.status === 'fulfilled') {
+                    console.log('表单提交成功 (策略1: 导航等待)');
+                    return true;
+                }
+            } catch (error) {
+                console.warn('策略1失败:', error.message);
+            }
+            
+            // 策略2: 直接点击按钮，不等待导航
+            try {
+                await page.locator('text=無料VPSの利用を継続する').click();
+                await setTimeout(3000); // 等待页面响应
+                
+                // 检查页面是否发生变化
+                const currentUrl = page.url();
+                console.log('提交后当前URL:', currentUrl);
+                
+                // 检查是否成功进入下一步
+                const pageChanged = await page.evaluate(() => {
+                    const bodyText = document.body.innerText;
+                    return !bodyText.includes('上の画像的数字を入力') && 
+                           (bodyText.includes('更新手続き') || bodyText.includes('契約更新') || bodyText.includes('利用期限'));
+                });
+                
+                if (pageChanged) {
+                    console.log('表单提交成功 (策略2: 直接点击)');
+                    return true;
+                }
+            } catch (error) {
+                console.warn('策略2失败:', error.message);
+            }
+            
+            // 策略3: JavaScript 直接提交表单
+            try {
+                const submitResult = await page.evaluate(() => {
+                    // 查找并提交表单
+                    const forms = document.querySelectorAll('form');
+                    for (const form of forms) {
+                        const submitButton = form.querySelector('button, input[type="submit"], input[value*="継続"]');
+                        if (submitButton) {
+                            submitButton.click();
+                            return true;
+                        }
+                    }
+                    
+                    // 查找提交按钮并点击
+                    const buttons = document.querySelectorAll('button, input[type="submit"]');
+                    for (const button of buttons) {
+                        if (button.textContent.includes('継続') || button.value.includes('継続')) {
+                            button.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                });
+                
+                if (submitResult) {
+                    await setTimeout(3000);
+                    console.log('表单提交成功 (策略3: JavaScript提交)');
+                    return true;
+                }
+            } catch (error) {
+                console.warn('策略3失败:', error.message);
+            }
+            
+        } catch (error) {
+            console.warn(`表单提交第 ${retry + 1} 次尝试失败:`, error.message);
+        }
+        
+        // 如果不是最后一次重试，等待一下再继续
+        if (retry < maxRetries - 1) {
+            await setTimeout(2000);
+        }
+    }
+    
+    console.error('所有表单提交策略均失败');
+    return false;
+}
+
+/**
+ * 检测 Turnstile 验证后的页面状态
+ */
+async function detectPageStateAfterTurnstile(page) {
+    try {
+        const pageState = await page.evaluate(() => {
+            const result = {
+                needsTraditionalCaptcha: false,
+                isComplete: false,
+                hasErrorMessage: false,
+                pageUrl: window.location.href,
+                currentForm: null
+            };
+            
+            // 检查是否有传统验证码图片
+            const captchaImg = document.querySelector('img[src^="data:"]');
+            if (captchaImg) {
+                result.needsTraditionalCaptcha = true;
+                result.currentForm = 'traditional_captcha';
+                return result;
+            }
+            
+            // 检查是否有验证码输入框
+            const captchaInput = document.querySelector('[placeholder="上の画像的数字を入力"]');
+            if (captchaInput) {
+                result.needsTraditionalCaptcha = true;
+                result.currentForm = 'traditional_captcha';
+                return result;
+            }
+            
+            // 检查是否已经到了续费按钮页面
+            const renewButton = document.querySelector('text=無料VPSの利用を継続する') || 
+                              document.querySelector('button:contains("無料VPSの利用を継続する")') ||
+                              document.querySelector('[value*="無料VPSの利用を継続する"]');
+            if (renewButton) {
+                result.isComplete = true;
+                result.currentForm = 'renewal_button';
+                return result;
+            }
+            
+            // 检查是否有错误消息
+            const errorMessages = [
+                '利用期限の1日前から更新手続きが可能です',
+                'エラー',
+                'error',
+                '失敗'
+            ];
+            
+            const bodyText = document.body.innerText;
+            for (const errorMsg of errorMessages) {
+                if (bodyText.includes(errorMsg)) {
+                    result.hasErrorMessage = true;
+                    result.errorType = errorMsg;
+                    break;
+                }
+            }
+            
+            // 检查页面内容，判断是否已经进入下一步
+            if (bodyText.includes('更新手続き') || bodyText.includes('契約更新')) {
+                result.isComplete = true;
+                result.currentForm = 'renewal_process';
+            }
+            
+            return result;
+        });
+        
+        return pageState;
+    } catch (error) {
+        console.warn('检测页面状态时出错:', error.message);
+        return {
+            needsTraditionalCaptcha: true, // 默认假设需要传统验证码
+            isComplete: false,
+            hasErrorMessage: false,
+            pageUrl: 'unknown',
+            currentForm: 'unknown'
+        };
+    }
+}
+
 // 生成北京时间字符串，格式 "YYYY-MM-DD HH:mm"
 function getBeijingTimeString() {
     const dt = new Date(Date.now() + 8 * 60 * 60 * 1000); // UTC+8
@@ -579,52 +879,74 @@ try {
     if (turnstileHandled) {
         console.log('Turnstile处理完成，等待验证结果...');
         await setTimeout(3000); // 等待验证处理完成
+        
+        // 检测页面状态变化
+        const pageStateAfterTurnstile = await detectPageStateAfterTurnstile(page);
+        console.log('Turnstile验证后页面状态:', pageStateAfterTurnstile);
+        
+        if (pageStateAfterTurnstile.needsTraditionalCaptcha) {
+            console.log('检测到仍需要传统验证码处理');
+        } else if (pageStateAfterTurnstile.isComplete) {
+            console.log('检测到Turnstile验证已完成整个验证流程，跳过传统验证码');
+            solved = true;
+        } else {
+            console.log('页面状态不明确，尝试传统验证码处理');
+        }
     } else {
         console.warn('Turnstile验证处理失败，但继续执行后续流程');
     }
     
-    for (let attempt = 1; attempt <= maxCaptchaTries; attempt++) {
-        const captchaImg = await page.$('img[src^="data:"]');
-        if (!captchaImg) {
-            console.log('无验证码，跳过验证码填写');
-            fs.writeFileSync('no_captcha.html', await page.content());
-            solved = true;
-            break;
+    // 只有在检测到需要传统验证码时才进行处理
+    if (!solved) {
+        for (let attempt = 1; attempt <= maxCaptchaTries; attempt++) {
+            console.log(`开始传统验证码处理尝试 ${attempt}/${maxCaptchaTries}`);
+            
+            // 增强的验证码图片检测
+            const captchaImg = await findCaptchaImageWithRetry(page);
+            if (!captchaImg) {
+                console.log('无验证码图片，跳过验证码填写');
+                fs.writeFileSync('no_captcha.html', await page.content());
+                solved = true;
+                break;
+            }
+    
+            const base64 = await captchaImg.evaluate(img => img.src);
+            let code = '';
+            try {
+                code = await fetch('https://captcha-120546510085.asia-northeast1.run.app', {
+                    method: 'POST',
+                    body: base64,
+                }).then(r => r.text());
+            } catch (err) {
+                console.warn(`验证码识别接口失败 (第 ${attempt} 次):`, err);
+                await captchaImg.screenshot({ path: `captcha_failed_${attempt}.png` });
+                continue;
+            }
+    
+            if (!code || code.length < 4) {
+                console.warn(`验证码识别失败 (第 ${attempt} 次)`);
+                await captchaImg.screenshot({ path: `captcha_failed_${attempt}.png` });
+                continue;
+            }
+    
+            // 增强的表单填充策略
+            const fillSuccess = await fillCaptchaWithFallback(page, code);
+            if (!fillSuccess) {
+                console.warn(`验证码填充失败 (第 ${attempt} 次)`);
+                continue;
+            }
+            
+            // 增强的提交和导航处理
+            const submitSuccess = await submitFormWithRetry(page);
+            if (submitSuccess) {
+                console.log(`验证码尝试成功 (第 ${attempt} 次)`);
+                solved = true;
+                break;
+            }
+    
+            console.warn(`验证码尝试失败 (第 ${attempt} 次)，刷新重试...`);
+            await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
         }
-    
-        const base64 = await captchaImg.evaluate(img => img.src);
-        let code = '';
-        try {
-            code = await fetch('https://captcha-120546510085.asia-northeast1.run.app', {
-                method: 'POST',
-                body: base64,
-            }).then(r => r.text());
-        } catch (err) {
-            console.warn(`验证码识别接口失败 (第 ${attempt} 次):`, err);
-            await captchaImg.screenshot({ path: `captcha_failed_${attempt}.png` });
-            continue;
-        }
-    
-        if (!code || code.length < 4) {
-            console.warn(`验证码识别失败 (第 ${attempt} 次)`);
-            await captchaImg.screenshot({ path: `captcha_failed_${attempt}.png` });
-            continue;
-        }
-    
-        await page.locator('[placeholder="上の画像的数字を入力"]').fill(code);
-        const [nav] = await Promise.allSettled([
-            page.waitForNavigation({ timeout: 30000, waitUntil: 'networkidle2' }),
-            page.locator('text=無料VPSの利用を継続する').click(),
-        ]);
-    
-        if (nav.status === 'fulfilled') {
-            console.log(`验证码尝试成功 (第 ${attempt} 次)`);
-            solved = true;
-            break;
-        }
-    
-        console.warn(`验证码尝试失败 (第 ${attempt} 次)，刷新重试...`);
-        await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
     }
     
     if (!solved) {
@@ -682,7 +1004,42 @@ try {
 
 } catch (e) {
     console.error('An error occurred during the renewal process:', e)
-    scriptErrorMessage = `🚨 **VPS 续期脚本执行出错** 🚨\n\n错误信息: \`${e.message}\`\n\n北京时间: ${getBeijingTimeString()}`
+    
+    // 增强的错误信息收集
+    let errorDetails = '';
+    try {
+        const currentUrl = page ? page.url() : 'unknown';
+        const pageTitle = page ? await page.title().catch(() => 'unknown') : 'unknown';
+        
+        errorDetails = `
+**错误详情:**
+- 错误类型: \`${e.name || 'Unknown'}\`
+- 错误消息: \`${e.message}\`
+- 当前页面: \`${currentUrl}\`
+- 页面标题: \`${pageTitle}\`
+- 错误堆栈: \`${e.stack ? e.stack.split('\n').slice(0, 3).join('\n') : 'No stack'}\`
+
+**调试信息:**
+- 脚本执行时间: ${getBeijingTimeString()}
+- 最后处理的到期日: \`${lastExpireDate || '无'}\``;
+
+        // 保存错误时的页面状态
+        if (page) {
+            try {
+                const errorPageContent = await page.content();
+                fs.writeFileSync('error_page_state.html', errorPageContent);
+                errorDetails += '\n- 错误页面状态已保存到 error_page_state.html';
+            } catch (saveError) {
+                console.warn('保存错误页面状态失败:', saveError.message);
+            }
+        }
+        
+    } catch (detailError) {
+        console.warn('收集错误详情时出错:', detailError.message);
+        errorDetails = `\n**基本错误信息:**\n- 错误消息: \`${e.message}\``;
+    }
+    
+    scriptErrorMessage = `🚨 **VPS 续期脚本执行出错** 🚨${errorDetails}\n\n北京时间: ${getBeijingTimeString()}`
 } finally {
     console.log('Script finished. Closing browser and saving recording.')
     await setTimeout(5000)

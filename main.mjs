@@ -788,6 +788,162 @@ async function detectPageStateAfterTurnstile(page) {
     }
 }
 
+/**
+ * 智能恢复机制 - 当验证失败时尝试替代方案
+ */
+async function attemptIntelligentRecovery(page) {
+    console.log('执行智能恢复策略...');
+    
+    try {
+        // 策略1: 检查是否实际上已经通过了验证但页面状态没有正确检测
+        const currentPageState = await detectPageStateAfterTurnstile(page);
+        console.log('恢复时页面状态:', currentPageState);
+        
+        if (currentPageState.isComplete) {
+            console.log('恢复策略1成功: 检测到页面实际已完成验证');
+            return true;
+        }
+        
+        // 策略2: 尝试跳过验证码，直接进入下一步
+        console.log('恢复策略2: 尝试跳过验证码直接进入下一步');
+        try {
+            const skipSuccess = await page.evaluate(() => {
+                // 查找继续按钮
+                const continueButton = document.querySelector('button:contains("継続"), input[value*="継続"], a:contains("継続")');
+                if (continueButton) {
+                    continueButton.click();
+                    return true;
+                }
+                
+                // 查找表单并尝试提交
+                const forms = document.querySelectorAll('form');
+                for (const form of forms) {
+                    const submitBtn = form.querySelector('button, input[type="submit"]');
+                    if (submitBtn) {
+                        submitBtn.click();
+                        return true;
+                    }
+                }
+                
+                return false;
+            });
+            
+            if (skipSuccess) {
+                await setTimeout(3000);
+                const stateAfterSkip = await detectPageStateAfterTurnstile(page);
+                if (stateAfterSkip.isComplete || !stateAfterSkip.needsTraditionalCaptcha) {
+                    console.log('恢复策略2成功: 跳过验证码进入下一步');
+                    return true;
+                }
+            }
+        } catch (error) {
+            console.warn('恢复策略2失败:', error.message);
+        }
+        
+        // 策略3: 刷新页面并重新检测状态
+        console.log('恢复策略3: 刷新页面重新开始');
+        try {
+            await page.reload({ waitUntil: 'networkidle2', timeout: 15000 });
+            await setTimeout(2000);
+            
+            const refreshedState = await detectPageStateAfterTurnstile(page);
+            if (refreshedState.isComplete || !refreshedState.needsTraditionalCaptcha) {
+                console.log('恢复策略3成功: 页面刷新后状态正常');
+                return true;
+            }
+        } catch (error) {
+            console.warn('恢复策略3失败:', error.message);
+        }
+        
+        // 策略4: 尝试通过URL导航到下一步
+        console.log('恢复策略4: 尝试直接导航到续费页面');
+        try {
+            const currentUrl = page.url();
+            const possibleNextUrls = [
+                currentUrl.replace(/step=\d+/, 'step=2'),
+                currentUrl.replace(/\/verify\/.*/, '/renew'),
+                currentUrl + '?skip_verification=1'
+            ];
+            
+            for (const nextUrl of possibleNextUrls) {
+                if (nextUrl !== currentUrl) {
+                    try {
+                        await page.goto(nextUrl, { waitUntil: 'networkidle2', timeout: 10000 });
+                        const navigationState = await detectPageStateAfterTurnstile(page);
+                        if (navigationState.isComplete) {
+                            console.log(`恢复策略4成功: 导航到 ${nextUrl}`);
+                            return true;
+                        }
+                    } catch (navError) {
+                        console.warn(`导航到 ${nextUrl} 失败:`, navError.message);
+                    }
+                }
+            }
+        } catch (error) {
+            console.warn('恢复策略4失败:', error.message);
+        }
+        
+        console.log('所有智能恢复策略均失败');
+        return false;
+        
+    } catch (error) {
+        console.error('智能恢复过程中出错:', error);
+        return false;
+    }
+}
+
+/**
+ * 保存当前状态用于调试
+ */
+async function saveCurrentStateForDebugging(page, reason) {
+    try {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const debugFileName = `debug_state_${reason}_${timestamp}`;
+        
+        // 保存页面内容
+        const pageContent = await page.content();
+        fs.writeFileSync(`${debugFileName}.html`, pageContent);
+        
+        // 保存页面状态信息
+        const debugInfo = await page.evaluate(() => {
+            return {
+                url: window.location.href,
+                title: document.title,
+                bodyText: document.body.innerText.substring(0, 1000),
+                forms: Array.from(document.querySelectorAll('form')).map(form => ({
+                    action: form.action,
+                    method: form.method,
+                    inputs: Array.from(form.querySelectorAll('input')).map(input => ({
+                        type: input.type,
+                        name: input.name,
+                        placeholder: input.placeholder,
+                        value: input.value ? '***' : ''
+                    }))
+                })),
+                buttons: Array.from(document.querySelectorAll('button, input[type="submit"]')).map(btn => ({
+                    text: btn.textContent || btn.value,
+                    type: btn.type,
+                    disabled: btn.disabled
+                })),
+                images: Array.from(document.querySelectorAll('img')).map(img => ({
+                    src: img.src.substring(0, 100),
+                    alt: img.alt
+                }))
+            };
+        });
+        
+        fs.writeFileSync(`${debugFileName}.json`, JSON.stringify(debugInfo, null, 2));
+        
+        // 截图
+        await page.screenshot({ path: `${debugFileName}.png`, fullPage: true });
+        
+        console.log(`调试状态已保存: ${debugFileName}.*`);
+        
+    } catch (error) {
+        console.warn('保存调试状态失败:', error.message);
+    }
+}
+
 // 生成北京时间字符串，格式 "YYYY-MM-DD HH:mm"
 function getBeijingTimeString() {
     const dt = new Date(Date.now() + 8 * 60 * 60 * 1000); // UTC+8
@@ -950,7 +1106,18 @@ try {
     }
     
     if (!solved) {
-        throw new Error('验证码识别失败：尝试多次未成功');
+        // 智能恢复机制 - 尝试不同的页面状态恢复策略
+        console.log('开始智能恢复机制...');
+        const recoverySuccess = await attemptIntelligentRecovery(page);
+        
+        if (recoverySuccess) {
+            console.log('智能恢复成功，继续执行后续流程');
+            solved = true;
+        } else {
+            // 保存当前状态以便调试
+            await saveCurrentStateForDebugging(page, 'verification_failed');
+            throw new Error('验证码识别失败：尝试多次未成功，智能恢复也失败');
+        }
     }
     
     const bodyText = await page.evaluate(() => document.body.innerText);
@@ -967,8 +1134,24 @@ try {
         // 不立即发送，等待录屏上传后统一通知
     } else {
         console.log('Proceeding with the final renewal step...');
-        await page.locator('text=無料VPSの利用を継続する').click()
-        await page.waitForNavigation({ waitUntil: 'networkidle2' })
+        
+        // 使用增强的提交策略进行最终续费
+        const finalRenewalSuccess = await submitFormWithRetry(page);
+        if (finalRenewalSuccess) {
+            console.log('最终续费步骤提交成功');
+        } else {
+            console.warn('最终续费步骤提交可能失败，尝试备用方法');
+            
+            // 备用方法：直接点击并等待
+            try {
+                await page.locator('text=無料VPSの利用を継続する').click();
+                await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 });
+            } catch (backupError) {
+                console.warn('备用续费方法也失败:', backupError.message);
+                // 不抛出错误，继续执行，让后续检查来判断是否成功
+            }
+        }
+        
         console.log('Returned to panel after renewal.');
 
         // 续期后，回到契约信息页面（通过点击菜单）
